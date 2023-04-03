@@ -1,0 +1,365 @@
+@@ -0,0 +1,8 @@
+resource "aws_eip" "eip1" {
+  depends_on = [aws_internet_gateway.eks]
+}
+
+resource "aws_eip" "eip2" {
+  depends_on = [aws_internet_gateway.eks]
+}
+
+ 67  
+eks-node-group.tf
+Comment on this file
+@@ -0,0 +1,67 @@
+resource "aws_iam_role" "node_role" {
+  name = "eks-node-group"
+
+  assume_role_policy = jsonencode({
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+    Version = "2012-10-17"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "node_ec2_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.node_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "node_cni_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.node_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_repo_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.node_role.name
+}
+
+# ********************INSTANCE GROUP********************
+
+resource "aws_eks_node_group" "node_group" {
+  cluster_name    = aws_eks_cluster.eks_cluster.name
+  node_group_name = "test-group"
+  node_role_arn   = aws_iam_role.node_role.arn
+  subnet_ids = [
+    aws_subnet.private_1.id,
+    aws_subnet.private_2.id
+  ]
+
+  instance_types = ["t2.micro"]
+
+  force_update_version = false
+
+  version = "1.18"
+
+  labels = {
+    role = "node-general"
+  }
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 1
+    min_size     = 1
+  }
+
+
+
+  # Ensure that IAM Role permissions are created before and deleted after EKS Node Group handling.
+  # Otherwise, EKS will not be able to properly delete EC2 Instances and Elastic Network Interfaces.
+  depends_on = [
+    aws_iam_role_policy_attachment.node_ec2_policy,
+    aws_iam_role_policy_attachment.node_cni_policy,
+    aws_iam_role_policy_attachment.ecr_repo_policy,
+  ]
+} 
+ 65  
+eks.tf
+Comment on this file
+@@ -0,0 +1,65 @@
+
+resource "aws_iam_role" "eks_role" {
+  name = "eks-role"
+
+  assume_role_policy = <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+POLICY
+}
+
+resource "aws_iam_role_policy_attachment" "eks_resource_policy_attach" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_role.name
+}
+
+# Optionally, enable Security Groups for Pods
+# Reference: https://docs.aws.amazon.com/eks/latest/userguide/security-groups-for-pods.html
+#resource "aws_iam_role_policy_attachment" "sg-policy-attach" {
+# policy_arn = "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
+# role       = aws_iam_role.eks-role.name
+#}
+
+# **************EKS CLUSTER***************
+
+resource "aws_eks_cluster" "eks_cluster" {
+  name     = "EKS-CLUSTER"
+  role_arn = aws_iam_role.eks_role.arn
+
+  version = "1.18"
+
+  vpc_config {
+    endpoint_private_access = false
+    endpoint_public_access  = true
+    subnet_ids = [
+      aws_subnet.public_1.id,
+      aws_subnet.public_2.id,
+      aws_subnet.private_1.id,
+      aws_subnet.private_2.id
+    ]
+  }
+
+  # Ensure that IAM Role permissions are created before and deleted after EKS Cluster handling.
+  # Otherwise, EKS will not be able to properly delete EKS managed EC2 infrastructure such as Security Groups.
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_resource_policy_attach,
+  ]
+}
+
+output "endpoint" {
+  value = aws_eks_cluster.eks_cluster.endpoint
+}
+
+output "kubeconfig-certificate-authority-data" {
+  value = aws_eks_cluster.eks_cluster.certificate_authority[0].data
+}
+ 13  
+igw.tf
+Comment on this file
+@@ -0,0 +1,13 @@
+resource "aws_internet_gateway" "eks" {
+  vpc_id = aws_vpc.eks.id
+  tags = {
+    Name = "eks"
+  }
+}
+
+
+output "nat_id" {
+  value       = aws_internet_gateway.eks.id
+  sensitive   = false
+  description = "NAT ID"
+}
+ 17  
+nat.tf
+Comment on this file
+@@ -0,0 +1,17 @@
+resource "aws_nat_gateway" "nat1" {
+  allocation_id = aws_eip.eip1.id
+  subnet_id     = aws_subnet.public_1.id
+
+  tags = {
+    Name = "NAT 1"
+  }
+}
+
+resource "aws_nat_gateway" "nat2" {
+  allocation_id = aws_eip.eip2.id
+  subnet_id     = aws_subnet.public_2.id
+
+  tags = {
+    Name = "NAT 2"
+  }
+}
+ 4  
+providers.tf
+Comment on this file
+@@ -0,0 +1,4 @@
+provider "aws" {
+  profile = "terraform"
+  region  = "ap-south-1"
+}
+ 41  
+route-table.tf
+Comment on this file
+@@ -0,0 +1,41 @@
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.eks.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+
+    gateway_id = aws_internet_gateway.eks.id
+  }
+
+  tags = {
+    Name = "public"
+  }
+}
+
+resource "aws_route_table" "private1" {
+  vpc_id = aws_vpc.eks.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+
+    nat_gateway_id = aws_nat_gateway.nat1.id
+  }
+
+  tags = {
+    Name = "private1"
+  }
+}
+
+resource "aws_route_table" "private2" {
+  vpc_id = aws_vpc.eks.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+
+    nat_gateway_id = aws_nat_gateway.nat2.id
+  }
+
+  tags = {
+    Name = "private2"
+  }
+}
+ 19  
+rt-association.tf
+Comment on this file
+@@ -0,0 +1,19 @@
+resource "aws_route_table_association" "public1" {
+  subnet_id      = aws_subnet.public_1.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public2" {
+  subnet_id      = aws_subnet.public_2.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private1" {
+  subnet_id      = aws_subnet.private_1.id
+  route_table_id = aws_route_table.private1.id
+}
+
+resource "aws_route_table_association" "private2" {
+  subnet_id      = aws_subnet.private_2.id
+  route_table_id = aws_route_table.private2.id
+}
+ 49  
+subnet.tf
+Comment on this file
+@@ -0,0 +1,49 @@
+# public subnet 
+
+resource "aws_subnet" "public_1" {
+  vpc_id                  = aws_vpc.eks.id
+  cidr_block              = "192.168.0.0/18"
+  availability_zone       = "ap-south-1a"
+  map_public_ip_on_launch = true
+  tags = {
+    Name                        = "public-mumbai-1a"
+    "kubernetes.io/cluster/eks" = "shared"
+    "kubernetes.io/role/elb"    = 1
+  }
+}
+
+resource "aws_subnet" "public_2" {
+  vpc_id                  = aws_vpc.eks.id
+  cidr_block              = "192.168.64.0/18"
+  availability_zone       = "ap-south-1b"
+  map_public_ip_on_launch = true
+  tags = {
+    Name                        = "public-mumbai-1b"
+    "kubernetes.io/cluster/eks" = "shared"
+    "kubernetes.io/role/elb"    = 1
+  }
+}
+
+#private subnet
+
+resource "aws_subnet" "private_1" {
+  vpc_id            = aws_vpc.eks.id
+  cidr_block        = "192.168.128.0/18"
+  availability_zone = "ap-south-1a"
+  tags = {
+    Name                              = "private-mumbai-1a"
+    "kubernetes.io/cluster/eks"       = "shared"
+    "kubernetes.io/role/internal-elb" = 1
+  }
+}
+
+resource "aws_subnet" "private_2" {
+  vpc_id            = aws_vpc.eks.id
+  cidr_block        = "192.168.192.0/18"
+  availability_zone = "ap-south-1b"
+  tags = {
+    Name                        = "private-mumbai-1b"
+    "kubernetes.io/cluster/eks" = "shared"
+    "kubernetes.io/role/elb"    = 1
+  }
+}
+ 17  
+vpc.tf
+Comment on this file
+@@ -0,0 +1,17 @@
+resource "aws_vpc" "eks" {
+  cidr_block                       = "192.168.0.0/16"
+  instance_tenancy                 = "default"
+  enable_dns_support               = true
+  enable_dns_hostnames             = true
+  enable_classiclink               = false
+  enable_classiclink_dns_support   = false
+  assign_generated_ipv6_cidr_block = false
+  tags = {
+    Name = "eks"
+  }
+}
+
+output "vpc_id" {
+  value       = aws_vpc.eks.id
+  description = "Created VPC ID"
+}
+0 comments on commit 68d3182
+@DussaDeepak
+ 
+Add heading textAdd bold text, <Ctrl+b>Add italic text, <Ctrl+i>
+Add a quote, <Ctrl+Shift+.>Add code, <Ctrl+e>Add a link, <Ctrl+k>
+Add a bulleted list, <Ctrl+Shift+8>Add a numbered list, <Ctrl+Shift+7>Add a task list, <Ctrl+Shift+l>
+Directly mention a user or team
+Reference an issue, pull request, or discussion
+Add saved reply
+Leave a comment
+No file chosen
+Attach files by dragging & dropping, selecting or pasting them.
+Styling with Markdown is supported
+ You’re not receiving notifications from this thread.
+Footer
+© 2023 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
+Docs
+Contact GitHub
+Pricing
+API
+Training
+Blog
+About
